@@ -89,4 +89,30 @@ struct DnsDomainTests {
         #expect(ComposeUp.dnsListContainsDomain(output, domain: "test") == false)
         #expect(ComposeUp.dnsListContainsDomain(output, domain: "dns") == false)
     }
+
+    // MARK: setuid helper detection
+
+    @Test("helper - setuid bit + root owner → privileged")
+    func helperRootSetuid() {
+        #expect(ComposeUp.helperLooksPrivileged(mode: 0o4755, ownerUID: 0) == true)
+        #expect(ComposeUp.helperLooksPrivileged(mode: 0o4555, ownerUID: 0) == true)
+    }
+
+    @Test("helper - missing setuid bit → not privileged (even when root-owned)")
+    func helperRootNoSetuid() {
+        #expect(ComposeUp.helperLooksPrivileged(mode: 0o0755, ownerUID: 0) == false)
+        #expect(ComposeUp.helperLooksPrivileged(mode: 0o0644, ownerUID: 0) == false)
+    }
+
+    @Test("helper - setuid bit but non-root owner → not privileged")
+    func helperSetuidWrongOwner() {
+        #expect(ComposeUp.helperLooksPrivileged(mode: 0o4755, ownerUID: 501) == false)
+        #expect(ComposeUp.helperLooksPrivileged(mode: 0o4755, ownerUID: 1000) == false)
+    }
+
+    @Test("helper - missing path returns false (no exception)")
+    func helperMissingPath() {
+        let path = "/tmp/Container-Compose-nonexistent-helper-\(UUID().uuidString)"
+        #expect(ComposeUp.dnsHelperInstalled(at: path) == false)
+    }
 }
