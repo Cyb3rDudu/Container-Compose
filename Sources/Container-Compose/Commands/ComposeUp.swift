@@ -156,8 +156,15 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             })
         }
 
-        // Stop Services
-        try await stopOldStuff(services.map({ $0.serviceName }), remove: true)
+        // Stop Services. Pass both default and explicit container_name so any
+        // pre-existing instance is cleaned up regardless of which name was used.
+        let containerNamesToStop: [String] = services.flatMap { (serviceName, service) -> [String] in
+            var names: [String] = []
+            if let projectName { names.append("\(projectName)-\(serviceName)") }
+            if let explicit = service.container_name, explicit != names.first { names.append(explicit) }
+            return names
+        }
+        try await stopOldStuffByName(containerNamesToStop, remove: true)
 
         // Process top-level networks
         // This creates named networks defined in the docker-compose.yml
@@ -243,11 +250,14 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private func stopOldStuff(_ services: [String], remove: Bool) async throws {
         guard let projectName else { return }
         let containers = services.map { "\(projectName)-\($0)" }
+        try await stopOldStuffByName(containers, remove: remove)
+    }
 
-        for container in containers {
-            print("Stopping container: \(container)")
-            let client = ContainerClient()
-            guard let container = try? await client.get(id: container) else { continue }
+    private func stopOldStuffByName(_ containers: [String], remove: Bool) async throws {
+        let client = ContainerClient()
+        for name in containers {
+            guard let container = try? await client.get(id: name) else { continue }
+            print("Stopping container: \(name)")
 
             do {
                 try await client.stop(id: container.id)
