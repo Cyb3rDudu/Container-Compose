@@ -8,3 +8,6 @@ DerivedData/
 .netrc
 .vscode/launch.json
 /helper/container-compose-dns-helper
+/CLAUDE.md
+/PLAN.md
+/libz.1.dylib
