@@ -159,16 +159,37 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // give every container a dotted name (`<svc>.<dnsDomain>`) and pass
         // `--dns-domain` so libc inside the container resolves peers via the
         // daemon's DNS server. If not, fall back to /etc/hosts patching.
+        //
+        // Three modes, in priority:
+        //   1. Domain already registered → use it.
+        //   2. Domain not registered, but the setuid helper is installed →
+        //      invoke the helper to register it (sudo-free).
+        //   3. Neither → fall back, and print the upgrade instructions.
         if let derived = Self.sanitizeDnsDomain(projectName ?? "") {
             dnsDomain = derived
-            dnsAvailable = await checkDnsDomainRegistered(derived)
+            var registered = await checkDnsDomainRegistered(derived)
+            let helperInstalled = Self.dnsHelperInstalled()
+            if !registered && helperInstalled {
+                if await registerDnsDomainViaHelper(derived) {
+                    print("Info: registered DNS domain '\(derived)' via setuid helper.")
+                    registered = true
+                }
+            }
+            dnsAvailable = registered
             if dnsAvailable {
                 print("Info: DNS domain '\(derived)' is registered. Using real DNS for inter-container resolution.")
+            } else if helperInstalled {
+                print("""
+                Warning: DNS helper is installed but failed to register '\(derived)'.
+                         Falling back to /etc/hosts patching.
+                """)
             } else {
                 print("""
                 Note: DNS domain '\(derived)' is not registered. Inter-container hostname
-                      resolution will fall back to /etc/hosts patching. For real DNS:
-                          sudo container system dns create \(derived)
+                      resolution will fall back to /etc/hosts patching. To upgrade:
+                        sudo container system dns create \(derived)        (one-time per project)
+                      Or install the setuid helper for sudo-free per-project enablement:
+                        cd <container-compose-checkout>/helper && make install-helper
                 """)
             }
         }
@@ -277,6 +298,49 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line == "DOMAIN" { continue }
             if line == domain { return true }
+        }
+        return false
+    }
+
+    /// Path to the optional setuid helper that can register DNS domains
+    /// without a sudo prompt at runtime. See `helper/dns-helper.c` and
+    /// `helper/Makefile` for the source and the install command.
+    static let dnsHelperPath = "/usr/local/libexec/container-compose-dns-helper"
+
+    /// Pure predicate over a file's POSIX mode and owner UID — true when the
+    /// binary will actually run as root when invoked. Factored out so it can
+    /// be unit-tested without needing a real setuid file on disk.
+    static func helperLooksPrivileged(mode: Int, ownerUID: UInt) -> Bool {
+        return (mode & 0o4000) != 0 && ownerUID == 0
+    }
+
+    /// True iff the helper exists at `path`, has the setuid bit, and is
+    /// owned by root. Doesn't try to exec it — purely a metadata check.
+    static func dnsHelperInstalled(at path: String = dnsHelperPath) -> Bool {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: path) else { return false }
+        let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        let owner = (attrs[.ownerAccountID] as? NSNumber)?.uintValue ?? UInt.max
+        return helperLooksPrivileged(mode: mode, ownerUID: owner)
+    }
+
+    /// Asks the installed helper to register `domain`. Idempotent on the
+    /// helper side (no-op success when the file already exists). Returns
+    /// true on success, false on any failure (and logs stderr to console).
+    private func registerDnsDomainViaHelper(_ domain: String) async -> Bool {
+        let process = Process()
+        process.launchPath = Self.dnsHelperPath
+        process.arguments = ["add", domain]
+        process.standardOutput = Pipe()
+        let stderr = Pipe()
+        process.standardError = stderr
+        do { try process.run() } catch { return false }
+        process.waitUntilExit()
+        if process.terminationStatus == 0 { return true }
+        let data = stderr.fileHandleForReading.readDataToEndOfFile()
+        if let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            print("Warning: dns helper failed: \(text)")
         }
         return false
     }
