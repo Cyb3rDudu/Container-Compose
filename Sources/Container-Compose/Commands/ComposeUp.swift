@@ -102,6 +102,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private var projectName: String?
     private var environmentVariables: [String: String] = [:]
     private var containerIps: [String: String] = [:]
+    /// Resolved container ID (i.e. the name on disk) per service.
+    /// Equal to `service.container_name` when set, otherwise `<projectName>-<serviceName>`.
+    private var serviceContainerNames: [String: String] = [:]
     private var containerConsoleColors: [String: NamedColor] = [:]
 
     private static let availableContainerConsoleColors: Set<NamedColor> = [
@@ -207,16 +210,23 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         fatalError("unreachable")
     }
 
+    private func containerName(for serviceName: String) -> String {
+        if let explicit = serviceContainerNames[serviceName] { return explicit }
+        if let projectName { return "\(projectName)-\(serviceName)" }
+        return serviceName
+    }
+
     private func getIPForRunningService(_ serviceName: String) async throws -> String? {
-        guard let projectName else { return nil }
+        return try await getIPForContainer(containerName(for: serviceName))
+    }
 
-        let containerName = "\(projectName)-\(serviceName)"
-
+    /// Returns the IP a peer container would use to reach this one (its own
+    /// interface address, not the bridge gateway).
+    private func getIPForContainer(_ name: String) async throws -> String? {
         let client = ContainerClient()
-        let container = try await client.get(id: containerName)
-        let ip = container.networks.compactMap { $0.ipv4Gateway.description }.first
-
-        return ip
+        guard let container = try? await client.get(id: name),
+              let net = container.networks.first else { return nil }
+        return net.ipv4Address.address.description
     }
 
     /// Repeatedly checks `container list -a` until the given container is listed as `running`.
@@ -226,15 +236,13 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     ///   - interval: How often to poll (in seconds).
     /// - Returns: `true` if the container reached "running" state within the timeout.
     private func waitUntilServiceIsRunning(_ serviceName: String, timeout: TimeInterval = 30, interval: TimeInterval = 0.5) async throws {
-        guard let projectName else { return }
-        let containerName = "\(projectName)-\(serviceName)"
-
+        let name = containerName(for: serviceName)
         let deadline = Date().addingTimeInterval(timeout)
         let client = ContainerClient()
 
         while Date() < deadline {
             try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            let container = try? await client.get(id: containerName)
+            let container = try? await client.get(id: name)
             if container?.status == .running {
                 return
             }
@@ -243,7 +251,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         throw NSError(
             domain: "ContainerWait", code: 1,
             userInfo: [
-                NSLocalizedDescriptionKey: "Timed out waiting for container '\(containerName)' to be running."
+                NSLocalizedDescriptionKey: "Timed out waiting for container '\(name)' to be running."
             ])
     }
 
@@ -282,6 +290,38 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         for (key, value) in environmentVariables.map({ ($0, $1) }) where value == serviceName {
             self.environmentVariables[key] = ip ?? value
         }
+        await crossPatchHostsForService(serviceName)
+    }
+
+    /// Apple `container` does not provide built-in DNS resolution between containers
+    /// on the same network. As each service comes up, mutate /etc/hosts in every
+    /// already-running peer to add `<thisIP> <thisService>`, and also add all the
+    /// previously-known peers into the new container. This is best-effort — services
+    /// that need DNS at startup time should still wait/retry.
+    private func crossPatchHostsForService(_ newServiceName: String) async {
+        guard let newIP = containerIps[newServiceName] else { return }
+        let newContainerID = containerName(for: newServiceName)
+        // Add the new entry in every previously-running peer.
+        for (peerName, peerIP) in containerIps where peerName != newServiceName {
+            let peerContainerID = containerName(for: peerName)
+            await appendHostsEntry(in: peerContainerID, name: newServiceName, ip: newIP)
+            // Also make the new container aware of this peer, in case it queries it later.
+            await appendHostsEntry(in: newContainerID, name: peerName, ip: peerIP)
+        }
+    }
+
+    private func appendHostsEntry(in containerID: String, name: String, ip: String) async {
+        // Idempotent: skip if the line is already present. Use the `container` CLI
+        // because the streaming exec API is not exposed here.
+        let line = "\(ip) \(name)"
+        let cmd = "grep -qF '\(line)' /etc/hosts 2>/dev/null || echo '\(line)' >> /etc/hosts"
+        let process = Process()
+        process.launchPath = "/usr/bin/env"
+        process.arguments = ["container", "exec", containerID, "sh", "-c", cmd]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do { try process.run() } catch { return }
+        process.waitUntilExit()
     }
 
     private func createVolumeHardLink(name volumeName: String, config volumeConfig: Volume) async {
@@ -407,6 +447,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             // Default container name based on project and service name
             containerName = "\(projectName)-\(serviceName)"
         }
+        serviceContainerNames[serviceName] = containerName
         runCommandArgs.append("--name")
         runCommandArgs.append(containerName)
 
@@ -562,15 +603,30 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             runCommandArgs.append("-t")  // --tty
         }
 
-        runCommandArgs.append(imageToRun)  // Add the image name as the final argument before command/entrypoint
-
-        // Add entrypoint or command
-        if let entrypointParts = service.entrypoint {
-            runCommandArgs.append("--entrypoint")
-            runCommandArgs.append(contentsOf: entrypointParts)
-        } else if let commandParts = service.command {
-            runCommandArgs.append(contentsOf: commandParts)
+        // Compose semantics: `entrypoint` overrides the image entrypoint, `command`
+        // is passed as the command to that entrypoint. Both can be set together.
+        // `container run --entrypoint <bin>` only takes a single executable, so any
+        // tail (`-c`, ...) plus the YAML `command:` go in as positional args after
+        // the image. Flag must precede the image.
+        let entrypointHead: String?
+        var positionalArgs: [String] = []
+        if let entrypointParts = service.entrypoint, !entrypointParts.isEmpty {
+            entrypointHead = entrypointParts.first
+            if entrypointParts.count > 1 {
+                positionalArgs.append(contentsOf: entrypointParts.dropFirst())
+            }
+        } else {
+            entrypointHead = nil
         }
+        if let commandParts = service.command {
+            positionalArgs.append(contentsOf: commandParts)
+        }
+
+        if let entrypointHead {
+            runCommandArgs.append(contentsOf: ["--entrypoint", entrypointHead])
+        }
+        runCommandArgs.append(imageToRun)
+        runCommandArgs.append(contentsOf: positionalArgs)
 
         var serviceColor: NamedColor = Self.availableContainerConsoleColors.randomElement()!
 
